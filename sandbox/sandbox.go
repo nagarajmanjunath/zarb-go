@@ -325,11 +325,17 @@ func (sb *SandboxConcrete) AppendNewBlock(hash crypto.Hash, height int) {
 	sb.recentBlocks.PushBack(hash, height)
 }
 
-func (sb *SandboxConcrete) VerifySortition(blockHash crypto.Hash, proof []byte, val *validator.Validator) bool {
+func (sb *SandboxConcrete) VerifySortition(blockHash crypto.Hash, proof sortition.Proof, val *validator.Validator) bool {
 	sb.lk.RLock()
 	defer sb.lk.RUnlock()
 
-	return sb.sortition.VerifyProof(blockHash, proof, val)
+	h, _ := sb.store.BlockHeight(blockHash)
+	b, err := sb.store.Block(h)
+	if err != nil {
+		return false
+	}
+
+	return sb.sortition.VerifyProof(b.Header().SortitionSeed(), proof, val.PublicKey(), val.Stake())
 }
 
 func (sb *SandboxConcrete) IterateAccounts(consumer func(*AccountStatus)) {

@@ -28,23 +28,25 @@ const baseSubsidy = 5 * 1e8
 type state struct {
 	lk deadlock.RWMutex
 
-	config           *Config
-	proposer         crypto.Address
-	genDoc           *genesis.Genesis
-	store            *store.Store
-	params           param.Params
-	txPool           txpool.TxPool
-	txPoolSandbox    *sandbox.SandboxConcrete
-	execution        *execution.Execution
-	executionSandbox *sandbox.SandboxConcrete
-	validatorSet     *validator.ValidatorSet
-	sortition        *sortition.Sortition
-	lastBlockHeight  int
-	lastBlockHash    crypto.Hash
-	lastReceiptsHash crypto.Hash
-	lastCommit       *block.Commit
-	lastBlockTime    time.Time
-	logger           *logger.Logger
+	config            *Config
+	signer            crypto.Signer
+	mintbaseAddr      crypto.Address
+	genDoc            *genesis.Genesis
+	store             *store.Store
+	params            param.Params
+	txPool            txpool.TxPool
+	txPoolSandbox     *sandbox.SandboxConcrete
+	execution         *execution.Execution
+	executionSandbox  *sandbox.SandboxConcrete
+	validatorSet      *validator.ValidatorSet
+	sortition         *sortition.Sortition
+	lastSortitionSeed sortition.Seed
+	lastBlockHeight   int
+	lastBlockHash     crypto.Hash
+	lastReceiptsHash  crypto.Hash
+	lastCommit        *block.Commit
+	lastBlockTime     time.Time
+	logger            *logger.Logger
 }
 
 func LoadOrNewState(
@@ -53,13 +55,25 @@ func LoadOrNewState(
 	signer crypto.Signer,
 	txPool txpool.TxPool) (State, error) {
 
+	var mintbaseAddr crypto.Address
+	if conf.MintbaseAddress != "" {
+		addr, err := crypto.AddressFromString(conf.MintbaseAddress)
+		if err != nil {
+			return nil, err
+		}
+		mintbaseAddr = addr
+	} else {
+		mintbaseAddr = signer.Address()
+	}
+
 	st := &state{
-		config:    conf,
-		genDoc:    genDoc,
-		txPool:    txPool,
-		params:    genDoc.Params(),
-		proposer:  signer.Address(),
-		sortition: sortition.NewSortition(signer),
+		config:       conf,
+		genDoc:       genDoc,
+		txPool:       txPool,
+		params:       genDoc.Params(),
+		signer:       signer,
+		mintbaseAddr: mintbaseAddr,
+		sortition:    sortition.NewSortition(),
 	}
 	st.logger = logger.NewLogger("_state", st)
 
@@ -123,6 +137,7 @@ func (st *state) tryLoadLastInfo() error {
 	st.lastBlockHash = b.Header().Hash()
 	st.lastCommit = &li.LastCommit
 	st.lastBlockTime = b.Header().Time()
+	st.lastSortitionSeed = b.Header().SortitionSeed()
 	st.lastReceiptsHash = li.LastReceiptHash
 
 	vals := make([]*validator.Validator, len(st.lastCommit.Committers()))
@@ -260,11 +275,7 @@ func (st *state) createSubsidyTx(fee int64) *tx.Tx {
 	seq := acc.Sequence() + 1
 	amt := calcBlockSubsidy(st.lastBlockHeight+1, st.params.SubsidyReductionInterval)
 
-	mintbaseAddr := st.config.MintbaseAddress
-	if mintbaseAddr == nil {
-		mintbaseAddr = &st.proposer
-	}
-	tx := tx.NewMintbaseTx(stamp, seq, *mintbaseAddr, amt+fee, "")
+	tx := tx.NewMintbaseTx(stamp, seq, st.mintbaseAddr, amt+fee, "")
 	return tx
 }
 
@@ -272,7 +283,7 @@ func (st *state) ProposeBlock(round int) (*block.Block, error) {
 	st.lk.Lock()
 	defer st.lk.Unlock()
 
-	if !st.validatorSet.IsProposer(st.proposer, round) {
+	if !st.validatorSet.IsProposer(st.signer.Address(), round) {
 		return nil, errors.Errorf(errors.ErrInvalidAddress, "We are not propser for this round")
 	}
 
@@ -322,6 +333,7 @@ func (st *state) ProposeBlock(round int) (*block.Block, error) {
 	stateHash := st.stateHash()
 	committeeHash := st.validatorSet.CommitteeHash()
 	timestamp := st.proposeNextBlockTime()
+	newSortitionSeed := st.lastSortitionSeed.Generate(st.signer)
 
 	block := block.MakeBlock(
 		st.params.BlockVersion,
@@ -332,7 +344,8 @@ func (st *state) ProposeBlock(round int) (*block.Block, error) {
 		stateHash,
 		st.lastReceiptsHash,
 		st.lastCommit,
-		st.proposer)
+		newSortitionSeed,
+		st.signer.Address())
 
 	return &block, nil
 }
@@ -369,11 +382,10 @@ func (st *state) CommitBlock(height int, block block.Block, commit block.Commit)
 		return nil
 	}
 
-	/// There are two modules can commit a block: Consensus and Syncer.
+	/// There are two modules that can commit a block: Consensus and Syncer.
 	/// Consensus engine is ours, we have full control over that and we know when and why a block should be committed.
-	/// In the other hand, Syncer module receives new blocks from other peers and if we are behind them, he tries to commit them.
+	/// In the other hand, Syncer module receives new blocks from other peers and if we are behind them, it tries to commit them.
 	/// We should never have a fork in our blockchain. but if it happens here we can catch it.
-
 	if st.lastBlockHeight == height {
 		if block.Hash().EqualsTo(st.lastBlockHash) {
 			st.logger.Debug("This block committed before", "hash", block.Hash())
@@ -399,6 +411,10 @@ func (st *state) CommitBlock(height int, block block.Block, commit block.Commit)
 	if !proposer.Address().EqualsTo(block.Header().ProposerAddress()) {
 		return errors.Errorf(errors.ErrInvalidBlock, "Invalid proposer. Expected %s, got %s", proposer.Address(), block.Header().ProposerAddress())
 	}
+	// Validate sortition seed
+	if !block.Header().SortitionSeed().Validate(proposer.PublicKey(), st.lastSortitionSeed) {
+		return errors.Errorf(errors.ErrInvalidBlock, "Invalid sortition seed.")
+	}
 
 	ctrxs, err := st.executeBlock(block)
 	if err != nil {
@@ -409,6 +425,9 @@ func (st *state) CommitBlock(height int, block block.Block, commit block.Commit)
 		return err
 	}
 
+	// Commit changes and update the validator set
+	st.commitSandbox(commit.Round())
+
 	// Save txs and receipts
 	receiptsHashes := make([]crypto.Hash, len(ctrxs))
 	for i, ctrx := range ctrxs {
@@ -417,22 +436,19 @@ func (st *state) CommitBlock(height int, block block.Block, commit block.Commit)
 
 		receiptsHashes[i] = ctrx.Receipt.Hash()
 	}
-
-	// Evaluate sortition before updating the validator set
-	if st.EvaluateSortition() {
-		st.logger.Info("👏 This validator is chosen to be in the set", "address", st.proposer)
-	}
-
-	// Commit changes and update the validator set
-	st.commitSandbox(commit.Round())
-
 	receiptsMerkle := merkle.NewTreeFromHashes(receiptsHashes)
 
 	st.lastBlockHeight++
 	st.lastBlockHash = block.Hash()
 	st.lastBlockTime = block.Header().Time()
+	st.lastSortitionSeed = block.Header().SortitionSeed()
 	st.lastReceiptsHash = receiptsMerkle.Root()
 	st.lastCommit = &commit
+
+	// Evaluate sortition before updating the validator set
+	if st.evaluateSortition() {
+		st.logger.Info("👏 This validator is chosen to be in the set", "address", st.signer.Address())
+	}
 
 	st.logger.Info("New block is committed", "block", block, "round", commit.Round())
 
@@ -449,13 +465,13 @@ func (st *state) CommitBlock(height int, block block.Block, commit block.Commit)
 	return nil
 }
 
-func (st *state) EvaluateSortition() bool {
-	if st.validatorSet.Contains(st.proposer) {
+func (st *state) evaluateSortition() bool {
+	if st.validatorSet.Contains(st.signer.Address()) {
 		// We are in the validator set right now
 		return false
 	}
 
-	val, _ := st.store.Validator(st.proposer)
+	val, _ := st.store.Validator(st.signer.Address())
 	if val == nil {
 		// We are not a validator
 		return false
@@ -467,10 +483,14 @@ func (st *state) EvaluateSortition() bool {
 	}
 
 	//
-	trx := st.sortition.EvaluateTransaction(st.lastBlockHash, val)
-	if trx != nil {
+	ok, proof := st.sortition.EvaluateSortition(st.lastSortitionSeed, st.signer, val.Stake())
+	if ok {
+		//
+		trx := tx.NewSortitionTx(st.lastBlockHash, val.Sequence()+1, val.Address(), proof)
+		st.signer.SignMsg(trx)
+
 		if err := st.txPool.AppendTxAndBroadcast(trx); err != nil {
-			st.logger.Error("Our sortition transaction is invalid. Why?", "address", st.proposer, "stake", val.Stake(), "tx", trx, "err", err)
+			st.logger.Error("Our sortition transaction is invalid. Why?", "address", st.signer.Address(), "stake", val.Stake(), "tx", trx, "err", err)
 			return false
 		}
 	}
